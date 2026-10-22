@@ -184,14 +184,14 @@ def ytdlp_download(url: str, folder: Path, maximum: int) -> dict:
                     for i, p in enumerate(sorted(files), 1)
                 ],
                 "provider": f"yt-dlp/{api}",
-                "warnings": ["Se usó el respaldo de video; no se pudo verificar si había fotos adicionales."],
+                "warnings": ["Se descargaron los videos, pero no se pudo comprobar si había fotos adicionales."],
             }
         except Exception as exc:
             issues.append(type(exc).__name__)
             shutil.rmtree(attempt, ignore_errors=True)
     raise BotProblem(
         "X no permitió obtener este contenido público. Puede estar eliminado, ser privado, "
-        "requerir iniciar sesión o existir un bloqueo temporal. Prueba otro enlace y actualiza yt-dlp."
+        "requerir iniciar sesión o existir un bloqueo temporal. Prueba otro enlace o inténtalo más tarde."
     )
 
 

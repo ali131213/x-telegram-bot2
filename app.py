@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import set_key
-from telegram import BotCommand, MessageOriginChannel, Update
+from telegram import BotCommand, BotCommandScopeChat, MessageOriginChannel, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, InvalidToken, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
@@ -51,15 +51,25 @@ class Service:
         self.active = False
 
     async def startup(self, app: Application):
-        await app.bot.set_my_commands([
-            BotCommand("start", "Cómo descargar y aviso de archivo"),
-            BotCommand("ayuda", "Ayuda y límites"),
-            BotCommand("id", "Mostrar tu ID de Telegram"),
+        public_commands = [
+            BotCommand("start", "Descargar de X/Twitter"),
+            BotCommand("ayuda", "Cómo usar el bot"),
             BotCommand("estado", "Comprobar que el bot está activo"),
-            BotCommand("version", "Verificar qué versión está funcionando"),
-            BotCommand("canales", "Administrador: ver canales detectados"),
-            BotCommand("archivo", "Administrador: vincular el canal privado"),
-        ])
+        ]
+        await app.bot.set_my_commands(public_commands)
+        if self.cfg.owner_id:
+            try:
+                await app.bot.set_my_commands(
+                    public_commands + [
+                        BotCommand("id", "Mostrar tu ID de Telegram"),
+                        BotCommand("version", "Comprobar la versión instalada"),
+                        BotCommand("canales", "Ver canales detectados"),
+                        BotCommand("archivo", "Vincular el canal de archivo"),
+                    ],
+                    scope=BotCommandScopeChat(chat_id=self.cfg.owner_id),
+                )
+            except TelegramError as exc:
+                LOG.warning("No se pudo configurar el menú del dueño: %s", type(exc).__name__)
         self.tasks = [
             asyncio.create_task(self.download_loop(app), name="descargas"),
             asyncio.create_task(self.archive_loop(app), name="archivo"),
@@ -82,48 +92,34 @@ class Service:
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
-            "Envíame un enlace de una publicación pública de X/Twitter, uno por mensaje.\n\n"
-            "Te devolveré sus videos, GIF y fotos con el autor y el texto en negrita. "
-            "Los videos grandes pueden llegar divididos sin recomprimir.\n\n"
-            "Aviso: el contenido descargado, tu nombre/usuario, tu ID de Telegram y "
-            "la fecha de la solicitud se copian al archivo privado del administrador.\n\n"
-            "No necesitas autorización ni estar suscrito a ningún canal.\n"
-            "/estado · /id · /ayuda"
+            "Envíame un enlace de X/Twitter y te devolveré sus videos y fotos.\n\n"
+            "Un enlace por mensaje."
         )
 
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
-            "• Envía el enlace completo de X o Twitter; se aceptan enlaces mobile y /video/1.\n"
-            "• Cada enlace descarga el contenido adjunto a esa publicación, no todo el hilo.\n"
-            "• Máximo 2 solicitudes pendientes por persona y 20 en cola.\n"
-            "• Fotos: archivo original por defecto. Videos: mejor MP4 disponible.\n"
-            "• Archivos de video grandes: partes menores de 49 MB, sin recomprimir.\n"
-            "• No descarga publicaciones privadas, eliminadas ni contenido que exija iniciar sesión.\n"
-            "• Si hay un bloqueo temporal de X, prueba otro enlace o inténtalo más tarde.\n\n"
-            "Solo el administrador usa /canales y /archivo."
+            "Envía un enlace público de X/Twitter, uno por mensaje.\n\n"
+            "Recibirás los videos, GIF y fotos de esa publicación. "
+            "Los videos grandes pueden llegar divididos en partes.\n\n"
+            "Si un enlace falla, verifica que la publicación siga disponible."
         )
 
     async def identify(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
-            f"Tu ID de Telegram: {update.effective_user.id}\n"
-            "Este número identifica tu cuenta. No es el ID de un canal."
+            f"Tu ID de Telegram: {update.effective_user.id}"
         )
 
     async def version(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
-            "X Archive Bot · Render Webhook v1.0\n"
-            "Descargas abiertas: sin lista de usuarios autorizados.\n"
-            "El ID del dueño solo protege los comandos de configuración."
+            "Descargador de X/Twitter · v1.1"
         )
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = (
-            "Bot activo. Acceso abierto.\n"
-            f"Descarga en curso: {'sí' if self.active else 'no'}\n"
-            f"Solicitudes esperando: {self.queue.qsize()}"
-        )
+        text = "✅ Bot activo."
         if self.is_owner(update):
             text += (
+                f"\nDescarga en curso: {'sí' if self.active else 'no'}"
+                f"\nSolicitudes esperando: {self.queue.qsize()}"
                 f"\nCanal de archivo: {self.cfg.archive_id or 'sin configurar'}"
                 f"\nCopias pendientes de archivo: {self.store.pending()}"
             )
@@ -131,7 +127,7 @@ class Service:
 
     async def channel_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_owner(update):
-            await update.effective_message.reply_text("Este comando configura el bot y es solo del administrador.")
+            await update.effective_message.reply_text("Comando no disponible.")
             return
         channels = self.store.channels()
         if not channels:
@@ -148,7 +144,7 @@ class Service:
 
     async def bind_archive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_owner(update):
-            await update.effective_message.reply_text("Este comando configura el bot y es solo del administrador.")
+            await update.effective_message.reply_text("Comando no disponible.")
             return
         if len(context.args) != 1:
             await update.effective_message.reply_text("Usa /canales y luego /archivo -100NUMERO_DEL_CANAL")
@@ -351,11 +347,6 @@ class Service:
             warning = "Avisos de esta descarga:\n" + "\n".join(failed)
             self.archive("text", None, html.escape(warning))
         result = f"✅ Entregados: {sent_count} archivo(s)."
-        result += (
-            "\nLa copia al archivo está en cola y se reintentará si el canal no responde."
-            if self.cfg.archive_id else
-            "\nEl administrador aún no ha configurado el canal de archivo."
-        )
         if failed:
             result += "\n\n⚠️ " + "\n".join(failed)
         await self.edit_status(app, job, result[:3900])
