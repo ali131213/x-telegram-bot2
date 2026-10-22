@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: x-telegram-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: ARCHIVE_CHAT_ID
+        sync: false
+      - key: TIMEZONE
+        value: America/Puerto_Rico
+      - key: PHOTO_MODE
+        value: original
+      - key: WEBHOOK_SECRET
+        generateValue: true
