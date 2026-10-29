@@ -11,6 +11,7 @@ import shutil
 import signal
 import sys
 import tempfile
+from io import BytesIO
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,9 +21,12 @@ from dotenv import set_key
 from telegram import BotCommand, BotCommandScopeChat, MessageOriginChannel, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, InvalidToken, RetryAfter, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
-from core import BASE, BotProblem, Requester, Settings, Store, caption, extract_links, full_text
+from core import (
+    BASE, BotProblem, Requester, Settings, Store, alias_user_id, caption, chunks,
+    extract_links, full_text, normalize_alias,
+)
 
 LOG = logging.getLogger("xbot")
 
@@ -33,6 +37,7 @@ class Job:
     status_message_id: int
     url: str
     requester: Requester
+    code: str = ""
 
 
 def retry_seconds(error: RetryAfter) -> float:
@@ -40,11 +45,12 @@ def retry_seconds(error: RetryAfter) -> float:
     return float(value.total_seconds() if hasattr(value, "total_seconds") else value) + 1
 
 
-class Service:
+class LegacyService:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
-        self.store = Store(cfg.data_dir / "archivo.sqlite3")
-        self.queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=20)
+        self.store = Store(cfg.data_dir / "archivo.sqlite3", cfg.database_url)
+        self.store.seed_aliases(cfg.initial_aliases, cfg.aliases)
+        self.queue: asyncio.Queue[Job] = asyncio.Queue()
         self.users: Counter[int] = Counter()
         self.tasks: list[asyncio.Task] = []
         self.archive_wakeup = asyncio.Event()
@@ -65,6 +71,15 @@ class Service:
                         BotCommand("version", "Comprobar la versión instalada"),
                         BotCommand("canales", "Ver canales detectados"),
                         BotCommand("archivo", "Vincular el canal de archivo"),
+                        BotCommand("alias", "Asignar o consultar una etiqueta por ID"),
+                        BotCommand("aliases", "Ver las etiquetas guardadas"),
+                        BotCommand("sinalias", "Quitar una etiqueta"),
+                        BotCommand("exportaralias", "Exportar las etiquetas"),
+                        BotCommand("registros", "Ver códigos de descargas y aportaciones"),
+                        BotCommand("nuevos", "Ver solicitantes no enlistados"),
+                        BotCommand("retirar", "Retirar entregas con confirmación"),
+                        BotCommand("pendientes", "Revisar copias de archivo pendientes"),
+                        BotCommand("reintentararchivo", "Reintentar las copias pendientes"),
                     ],
                     scope=BotCommandScopeChat(chat_id=self.cfg.owner_id),
                 )
@@ -111,7 +126,7 @@ class Service:
 
     async def version(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
-            "Descargador de X/Twitter · v1.1"
+            "Descargador de X/Twitter · v1.3"
         )
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -122,8 +137,92 @@ class Service:
                 f"\nSolicitudes esperando: {self.queue.qsize()}"
                 f"\nCanal de archivo: {self.cfg.archive_id or 'sin configurar'}"
                 f"\nCopias pendientes de archivo: {self.store.pending()}"
+                f"\nEtiquetas guardadas: {len(self.store.all_aliases())}"
+                f"\nRegistro persistente: {'PostgreSQL' if self.store.persistent else 'SQLite local temporal en Render'}"
             )
         await update.effective_message.reply_text(text)
+
+    async def alias_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_owner(update):
+            await update.effective_message.reply_text("Comando no disponible.")
+            return
+        if not context.args:
+            await update.effective_message.reply_text(
+                "Asignar: /alias ID Nombre o etiqueta\n"
+                "Consultar: /alias ID\n"
+                "Ejemplo: /alias 123456789 Jan\n\n"
+                "/aliases · /sinalias ID · /exportaralias"
+            )
+            return
+        try:
+            uid = alias_user_id(context.args[0])
+            if len(context.args) == 1:
+                current = self.store.alias_for(uid)
+                await update.effective_message.reply_text(
+                    f"{uid}: {current}" if current else f"El ID {uid} todavía no tiene etiqueta."
+                )
+                return
+            label = normalize_alias(" ".join(context.args[1:]))
+            self.store.set_alias(uid, label)
+        except BotProblem as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        await update.effective_message.reply_text(
+            f"✅ {uid} → {label}\nSe usará en los próximos registros de la galería.\n\n"
+            + ("El cambio quedó guardado en PostgreSQL." if self.store.persistent else
+               "Para conservar el cambio tras reinicios de Render, usa /exportaralias y guarda el JSON en USER_ALIASES_JSON.")
+        )
+
+    async def aliases_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_owner(update):
+            await update.effective_message.reply_text("Comando no disponible.")
+            return
+        aliases = self.store.all_aliases()
+        text = (
+            "Etiquetas guardadas:\n\n" + "\n".join(f"{uid} → {name}" for uid, name in aliases.items())
+            if aliases else "Todavía no hay etiquetas. Usa /alias ID Nombre."
+        )
+        for piece in chunks(text):
+            await update.effective_message.reply_text(piece)
+
+    async def alias_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_owner(update):
+            await update.effective_message.reply_text("Comando no disponible.")
+            return
+        if len(context.args) != 1:
+            await update.effective_message.reply_text("Usa /sinalias ID")
+            return
+        try:
+            uid = alias_user_id(context.args[0])
+            self.store.remove_alias(uid)
+        except BotProblem as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        await update.effective_message.reply_text(
+            f"Etiqueta eliminada para {uid}. Los próximos registros usarán su nombre de Telegram.\n\n"
+            + ("El cambio quedó guardado en PostgreSQL." if self.store.persistent else
+               "Usa /exportaralias y actualiza USER_ALIASES_JSON en Render para conservar este cambio.")
+        )
+
+    async def aliases_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.is_owner(update):
+            await update.effective_message.reply_text("Comando no disponible.")
+            return
+        snapshot = self.store.aliases_json()
+        with BytesIO(snapshot.encode("utf-8")) as document:
+            await update.effective_message.reply_document(
+                document=document, filename="alias_usuarios.json",
+                caption=(
+                    "Copia de respaldo de etiquetas. En modo local puedes guardar su contenido en Render → Environment → "
+                    "USER_ALIASES_JSON y guarda/aplica los cambios. "
+                    "El nombre de la variable es USER_ALIASES_JSON; su valor es el JSON, no el nombre del archivo."
+                ),
+            )
+        if len(snapshot.encode("utf-16-le")) <= 5000:
+            await update.effective_message.reply_text(
+                "También puedes copiar el valor desde aquí:\n\n"
+                f"<code>{html.escape(snapshot)}</code>", parse_mode=ParseMode.HTML,
+            )
 
     async def channel_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_owner(update):
@@ -195,46 +294,6 @@ class Service:
         if chat and chat.type == ChatType.CHANNEL:
             self.store.remember_channel(chat.id, chat.title or str(chat.id))
 
-    async def message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        message = update.effective_message
-        origin = message.forward_origin
-        if self.is_owner(update) and isinstance(origin, MessageOriginChannel):
-            self.store.remember_channel(origin.chat.id, origin.chat.title or str(origin.chat.id))
-            await message.reply_text(
-                f"Canal detectado: {origin.chat.title}\n"
-                f"Para vincularlo usa:\n/archivo {origin.chat.id}"
-            )
-            return
-        text = message.text or message.caption or ""
-        # Include hyperlinks whose visible label is different from the URL.
-        for entity in (*(message.entities or ()), *(message.caption_entities or ())):
-            if entity.url:
-                text += "\n" + entity.url
-        links = extract_links(text)
-        if len(links) != 1:
-            await message.reply_text(
-                "Envía un solo enlace de una publicación de X/Twitter por mensaje. "
-                "Ejemplo: https://x.com/cuenta/status/123456789"
-            )
-            return
-        user = update.effective_user
-        if self.users[user.id] >= 2:
-            await message.reply_text("Ya tienes 2 solicitudes pendientes. Espera a que termine una.")
-            return
-        if self.queue.full():
-            await message.reply_text("La cola está llena. Inténtalo nuevamente cuando termine alguna descarga.")
-            return
-        position = self.queue.qsize() + (1 if self.active else 0)
-        status_message = await message.reply_text(
-            "Enlace recibido. " + (f"Hay {position} solicitud(es) por delante." if position else "Preparando descarga…")
-        )
-        requester = Requester(
-            id=user.id, name=user.full_name, username=user.username,
-            requested_at=message.date or datetime.now(timezone.utc),
-        )
-        job = Job(message.chat_id, status_message.message_id, links[0], requester)
-        self.users[user.id] += 1
-        self.queue.put_nowait(job)
 
     async def edit_status(self, app: Application, job: Job, text: str):
         with contextlib.suppress(TelegramError):
@@ -307,124 +366,10 @@ class Service:
                 await asyncio.sleep(retry_seconds(exc))
         raise BotProblem("Telegram no aceptó el archivo.")
 
-    def archive(self, kind: str, file_id: str | None, body: str, extra=None):
-        if self.cfg.archive_id:
-            self.store.enqueue(self.cfg.archive_id, kind, file_id, body, extra)
-            self.archive_wakeup.set()
 
-    async def deliver(self, app: Application, job: Job, post: dict):
-        finished = datetime.now(timezone.utc)
-        long_text = False
-        sent_count = 0
-        failed = list(post.get("warnings") or [])
-        for media in post["media"]:
-            body, clipped_user = caption(post, media["label"], self.cfg)
-            archive_body, clipped_archive = caption(
-                post, media["label"], self.cfg, job.requester, finished
-            )
-            long_text |= clipped_user or clipped_archive
-            try:
-                _, kind, file_id, extra = await self.upload(app, job.chat_id, media, body)
-                self.archive(kind, file_id, archive_body, extra)
-                sent_count += 1
-            except Forbidden:
-                raise
-            except TelegramError:
-                failed.append(f"{media['label']}: Telegram no confirmó el envío.")
-            # Space uploads to a single recipient; RetryAfter is also handled explicitly.
-            await asyncio.sleep(1.1)
-        if not sent_count:
-            raise BotProblem("No se pudo entregar ningún archivo. " + " ".join(failed))
-        if long_text:
-            for text in full_text(post):
-                try:
-                    await app.bot.send_message(job.chat_id, text, parse_mode=ParseMode.HTML)
-                except TelegramError:
-                    failed.append("No se pudo entregar una parte del texto completo.")
-                self.archive("text", None, text)
-                await asyncio.sleep(1.1)
-        if failed:
-            warning = "Avisos de esta descarga:\n" + "\n".join(failed)
-            self.archive("text", None, html.escape(warning))
-        result = f"✅ Entregados: {sent_count} archivo(s)."
-        if failed:
-            result += "\n\n⚠️ " + "\n".join(failed)
-        await self.edit_status(app, job, result[:3900])
 
-    async def download_loop(self, app: Application):
-        while True:
-            job = await self.queue.get()
-            self.active = True
-            try:
-                await self.edit_status(app, job, "Descargando y preparando los archivos…")
-                with tempfile.TemporaryDirectory(prefix="xbot_") as temporary:
-                    post = await self.run_downloader(job, Path(temporary))
-                    await self.edit_status(app, job, "Descarga lista. Enviando a Telegram…")
-                    await self.deliver(app, job, post)
-            except BotProblem as exc:
-                await self.edit_status(app, job, "No se completó la descarga.\n\n" + str(exc))
-            except asyncio.TimeoutError:
-                minutes = self.cfg.request_timeout // 60
-                await self.edit_status(
-                    app, job, f"La descarga tardó más de {minutes} minutos y se detuvo. Puedes reenviar el enlace."
-                )
-            except Forbidden:
-                LOG.warning("El solicitante bloqueó el bot o cerró el chat antes de recibir los archivos.")
-            except asyncio.CancelledError:
-                await self.edit_status(app, job, "El bot se está reiniciando. Vuelve a enviar este enlace cuando esté activo.")
-                raise
-            except Exception as exc:
-                LOG.error("Error de descarga: %s", type(exc).__name__)
-                await self.edit_status(app, job, "Ocurrió un error al procesar el enlace. Prueba otro enlace público.")
-            finally:
-                self.users[job.requester.id] -= 1
-                if not self.users[job.requester.id]:
-                    del self.users[job.requester.id]
-                self.active = False
-                self.queue.task_done()
 
-    async def send_archive_job(self, app: Application, job):
-        extra = json.loads(job["extra"])
-        base = {
-            "chat_id": job["chat_id"], "caption": job["body"],
-            "parse_mode": ParseMode.HTML, "disable_notification": True,
-        }
-        kind = job["kind"]
-        if kind == "text":
-            await app.bot.send_message(
-                job["chat_id"], job["body"], parse_mode=ParseMode.HTML, disable_notification=True
-            )
-        elif kind == "video":
-            await app.bot.send_video(video=job["file_id"], supports_streaming=True, **extra, **base)
-        elif kind == "photo":
-            await app.bot.send_photo(photo=job["file_id"], **base)
-        else:
-            await app.bot.send_document(document=job["file_id"], **base)
 
-    async def archive_loop(self, app: Application):
-        while True:
-            self.archive_wakeup.clear()
-            job = self.store.next_job()
-            if job is None:
-                try:
-                    await asyncio.wait_for(self.archive_wakeup.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-            try:
-                await self.send_archive_job(app, job)
-            except RetryAfter as exc:
-                self.store.retry(job["id"], retry_seconds(exc))
-            except TelegramError as exc:
-                delay = min(3600, 30 * 2 ** min(job["attempts"], 7))
-                self.store.retry(job["id"], delay)
-                LOG.warning("Copia de archivo pendiente; se reintentará. Motivo: %s", type(exc).__name__)
-            except Exception as exc:
-                self.store.retry(job["id"], 300)
-                LOG.error("Error de archivo: %s", type(exc).__name__)
-            else:
-                self.store.done(job["id"])
-            await asyncio.sleep(3.1)
 
     async def error(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         if isinstance(context.error, Conflict):
@@ -433,16 +378,30 @@ class Service:
             LOG.error("Error de Telegram: %s", type(context.error).__name__)
 
 
-def build_application(cfg: Settings, *, polling: bool = True) -> Application:
+
+from workflow import WorkflowMixin
+
+
+class Service(WorkflowMixin, LegacyService):
+    pass
+
+
+def build_application(cfg: Settings, *, polling: bool = True, request=None) -> Application:
     service = Service(cfg)
     builder = (
-        Application.builder().token(cfg.token).connect_timeout(30).read_timeout(120)
-        .write_timeout(300).pool_timeout(30).connection_pool_size(8)
+        Application.builder().token(cfg.token)
         .get_updates_connect_timeout(30).get_updates_read_timeout(45)
         .post_init(service.startup).post_stop(service.shutdown)
     )
     if not polling:
         builder = builder.updater(None)
+    if request is not None:
+        builder = builder.request(request)
+    else:
+        builder = (
+            builder.connect_timeout(30).read_timeout(120)
+            .write_timeout(300).pool_timeout(30).connection_pool_size(8)
+        )
     app = builder.build()
     app.bot_data["service"] = service
     private = filters.ChatType.PRIVATE
@@ -451,8 +410,14 @@ def build_application(cfg: Settings, *, polling: bool = True) -> Application:
         ("id", service.identify), ("estado", service.status),
         ("health", service.status), ("version", service.version),
         ("canales", service.channel_list), ("archivo", service.bind_archive),
+        ("alias", service.alias_command), ("aliases", service.aliases_list),
+        ("sinalias", service.alias_remove), ("exportaralias", service.aliases_export),
+        ("registros", service.admin_records), ("nuevos", service.admin_unlisted),
+        ("pendientes", service.admin_pending), ("reintentararchivo", service.admin_retry),
+        ("retirar", service.withdraw),
     ):
         app.add_handler(CommandHandler(command, callback, filters=private))
+    app.add_handler(CallbackQueryHandler(service.withdrawal_callback, pattern=r"^rt_"))
     app.add_handler(MessageHandler(private & ~filters.COMMAND, service.message))
     app.add_handler(TypeHandler(Update, service.observe), group=-1)
     app.add_error_handler(service.error)
@@ -471,7 +436,7 @@ def main() -> int:
             raise BotProblem("Falta FFmpeg. Instálalo en tu Mac con: brew install ffmpeg")
         app = build_application(cfg)
         app.run_polling(
-            allowed_updates=["message", "channel_post", "my_chat_member"],
+            allowed_updates=["message", "channel_post", "my_chat_member", "callback_query"],
             drop_pending_updates=False, timeout=30, bootstrap_retries=3,
         )
         return 0

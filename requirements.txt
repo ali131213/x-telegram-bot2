@@ -3,3 +3,4 @@ yt-dlp==2026.10.21
 httpx[socks]==0.28.1
 python-dotenv==1.2.4
 tornado==6.6
+psycopg[binary]==3.3.6

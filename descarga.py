@@ -276,6 +276,9 @@ def download(url: str, folder: Path, maximum: int, upload_limit: int) -> dict:
             warnings.append(f"{media['label']}: no se pudo preparar el archivo para Telegram.")
     if not prepared:
         raise BotProblem("No se pudo preparar ningún archivo. " + " ".join(warnings))
+    for i, media in enumerate(prepared, 1):
+        # One simple sequence across all delivered attachments and split parts.
+        media["label"] = f"({i}/{len(prepared)})"
     post["media"] = prepared
     post["warnings"] = warnings
     return post

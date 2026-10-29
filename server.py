@@ -73,14 +73,16 @@ class Webhook(tornado.web.RequestHandler):
             self.finish({"ok": False})
             return
         store = self.bot_app.bot_data["service"].store
-        if not store.seen_update(update.update_id):
-            # The queue is bounded to prevent webhook bursts exhausting RAM.
-            if self.bot_app.update_queue.qsize() >= 100:
-                self.set_status(503)
-                self.finish({"ok": False})
-                return
-            await self.bot_app.update_queue.put(update)
-            store.mark_update(update.update_id)
+        try:
+            # Acknowledge only after saving the incoming update. On a DB error
+            # Telegram receives 503 and can retry rather than losing the request.
+            store.accept_update(update.update_id, data)
+        except Exception as exc:
+            LOG.error("No se confirmó recepción: %s", type(exc).__name__)
+            self.set_status(503)
+            self.finish({"ok": False})
+            return
+        self.bot_app.bot_data["service"].inbox_wakeup.set()
         self.write({"ok": True})
 
 
@@ -122,7 +124,7 @@ async def serve():
                 state["ready"] = True
                 await bot_app.bot.set_webhook(
                     url=public_url + "/webhook", secret_token=secret,
-                    allowed_updates=["message", "channel_post", "my_chat_member"],
+                    allowed_updates=["message", "channel_post", "my_chat_member", "callback_query"],
                     max_connections=1, drop_pending_updates=False,
                 )
                 LOG.info("Webhook activo. Health: /health. Acceso abierto a todos los chats privados.")
